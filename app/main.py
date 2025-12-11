@@ -101,7 +101,7 @@ def get_timeline():
     """
     Devuelve todos los releases ordenados cronológicamente.
     Más reciente primero.
-    
+
     Returns:
         {
             "releases": [
@@ -118,8 +118,5 @@ def get_timeline():
     """
     releases = list(releases_db.values())
     releases.sort(key=lambda r: r["timestamp"], reverse=True)
-    
-    return {
-        "releases": releases,
-        "count": len(releases)
-    }
+
+    return {"releases": releases, "count": len(releases)}
