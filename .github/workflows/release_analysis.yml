@@ -1,0 +1,170 @@
+name: Release Analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version del release (ej: v1.2.0)"
+        required: true
+        default: "v1.0.0"
+      quality:
+        description: "Calidad de metricas (normal/risky/random)"
+        required: true
+        default: "random"
+        type: choice
+        options:
+          - normal
+          - risky
+          - random
+
+jobs:
+  analyze-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Start API in background
+        run: |
+          uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+          sleep 5
+          echo "API started"
+
+      - name: Wait for API to be ready
+        run: |
+          for i in {1..10}; do
+            if curl -f http://localhost:8000/health; then
+              echo "API is ready"
+              break
+            fi
+            echo "Waiting for API... ($i/10)"
+            sleep 2
+          done
+
+      - name: Generate metrics
+        run: |
+          python scripts/generate_metrics.py \
+            --version ${{ github.event.inputs.version }} \
+            --quality ${{ github.event.inputs.quality }}
+
+          echo "Metrics generated for ${{ github.event.inputs.version }}"
+
+      - name: Register release
+        run: |
+          METRICS=$(cat app/data/metrics/metrics-${{ github.event.inputs.version }}.json)
+
+          curl -X POST http://localhost:8000/releases \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"version\": \"${{ github.event.inputs.version }}\",
+              \"commit\": \"${{ github.sha }}\",
+              \"metrics\": $METRICS
+            }"
+
+          echo "Release registered"
+
+      - name: Analyze release
+        id: analysis
+        run: |
+          ANALYSIS=$(curl -s http://localhost:8000/analysis/${{ github.event.inputs.version }})
+          echo "$ANALYSIS" | jq .
+
+          # Extraer status
+          STATUS=$(echo "$ANALYSIS" | jq -r '.status')
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+          # Guardar análisis completo
+          echo "$ANALYSIS" > analysis-result.json
+
+      - name: Generate evidence report
+        run: |
+          mkdir -p .evidence
+
+          cat > .evidence/release-risk-report.json << EOF
+          {
+            "workflow_run": "${{ github.run_id }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "release": {
+              "version": "${{ github.event.inputs.version }}",
+              "commit": "${{ github.sha }}",
+              "quality_requested": "${{ github.event.inputs.quality }}"
+            },
+            "analysis": $(cat analysis-result.json)
+          }
+          EOF
+
+          echo "Evidence report generated"
+          cat .evidence/release-risk-report.json | jq .
+
+      # ============================================
+      # SPRINT 3: NUEVO - TIMELINE SNAPSHOT
+      # ============================================
+      - name: Generate timeline snapshot
+        run: |
+          echo "Capturing timeline snapshot..."
+          TIMELINE=$(curl -s http://localhost:8000/timeline)
+          echo "$TIMELINE" | jq . > timeline.json
+          
+          echo "Timeline captured with $(echo "$TIMELINE" | jq -r '.count') releases"
+          cat timeline.json | jq .
+
+      - name: Upload timeline as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: timeline-${{ github.event.inputs.version }}
+          path: timeline.json
+          retention-days: 30
+      # ============================================
+      # FIN SPRINT 3
+      # ============================================
+
+      - name: Upload evidence as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-risk-report
+          path: .evidence/release-risk-report.json
+          retention-days: 30
+
+      - name: Commit evidence to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add .evidence/release-risk-report.json
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "evidence: add release analysis report for ${{ github.event.inputs.version }}"
+            git push
+          fi
+
+      - name: Summary
+        run: |
+          echo "## Release Analysis Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ github.event.inputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ steps.analysis.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Quality:** ${{ github.event.inputs.quality }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Analysis Result" >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          cat analysis-result.json | jq . >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.analysis.outputs.status }}" == "RIESGOSO" ]; then
+            echo "**WARNING:** This release is classified as RISKY!" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "This release is classified as OK" >> $GITHUB_STEP_SUMMARY
+          fi

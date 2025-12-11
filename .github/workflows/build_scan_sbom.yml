@@ -1,0 +1,142 @@
+name: Build, Scan & SBOM
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-scan-sbom:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -t release-radar:latest .
+          echo "Image built successfully"
+
+      - name: Save image info
+        run: |
+          docker images release-radar:latest
+          docker inspect release-radar:latest | jq '.[0].Config' > image-config.json
+
+      - name: Scan image with Trivy
+        run: |
+          # Instalar Trivy si no está disponible
+          if ! command -v trivy &> /dev/null; then
+            echo "Installing Trivy..."
+            # Instalar desde binario oficial (compatible con cualquier distro)
+            wget -qO trivy.tar.gz https://github.com/aquasecurity/trivy/releases/download/v0.48.0/trivy_0.48.0_Linux-64bit.tar.gz
+            tar zxvf trivy.tar.gz
+            sudo mv trivy /usr/local/bin/
+            rm trivy.tar.gz
+          fi
+
+          # Scan de la imagen
+          trivy image --format json --output trivy-report.json release-radar:latest
+
+          echo "Trivy scan completed"
+
+          # Mostrar resumen
+          trivy image --severity HIGH,CRITICAL release-radar:latest
+
+      - name: Generate SBOM with Syft
+        run: |
+          # Instalar Syft si no está disponible
+          if ! command -v syft &> /dev/null; then
+            echo "Installing Syft..."
+            curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
+          fi
+
+          # Generar SBOM
+          syft release-radar:latest -o json > sbom.json
+
+          echo "SBOM generated"
+
+          # Mostrar resumen
+          syft release-radar:latest -o table
+
+      - name: Save evidence
+        run: |
+          mkdir -p .evidence
+
+          # Copiar reportes a .evidence/
+          cp trivy-report.json .evidence/trivy-report.json
+          cp sbom.json .evidence/sbom.json
+
+          # Crear resumen
+          cat > .evidence/scan-summary.json << EOF
+          {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "workflow_run": "${{ github.run_id }}",
+            "commit": "${{ github.sha }}",
+            "image": "release-radar:latest",
+            "scans": {
+              "trivy": ".evidence/trivy-report.json",
+              "sbom": ".evidence/sbom.json"
+            }
+          }
+          EOF
+
+          echo "Evidence saved"
+
+      - name: Upload Trivy report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: .evidence/trivy-report.json
+          retention-days: 30
+
+      - name: Upload SBOM as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: .evidence/sbom.json
+          retention-days: 30
+
+      - name: Commit evidence to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Fetch y pull para evitar conflictos
+          git fetch origin
+          git pull origin ${{ github.ref_name }} --rebase || true
+
+          git add .evidence/
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "evidence: add build scan and SBOM reports [skip ci]"
+            git push origin HEAD:${{ github.ref_name }} || echo "Push failed, but continuing..."
+          fi
+
+      - name: Check for critical vulnerabilities
+        run: |
+          CRITICAL_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' .evidence/trivy-report.json)
+          HIGH_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' .evidence/trivy-report.json)
+
+          echo "## Security Scan Summary " >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** release-radar:latest" >> $GITHUB_STEP_SUMMARY
+          echo "**Critical vulnerabilities:** $CRITICAL_COUNT" >> $GITHUB_STEP_SUMMARY
+          echo "**High vulnerabilities:** $HIGH_COUNT" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$CRITICAL_COUNT" -gt 0 ]; then
+            echo "**WARNING:** Critical vulnerabilities found!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Critical Vulnerabilities" >> $GITHUB_STEP_SUMMARY
+            jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL") | "- **\(.VulnerabilityID)**: \(.PkgName) (\(.InstalledVersion))"' .evidence/trivy-report.json >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No critical vulnerabilities found" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**SBOM generated:** ${{ github.repository }}/blob/${{ github.sha }}/.evidence/sbom.json" >> $GITHUB_STEP_SUMMARY
